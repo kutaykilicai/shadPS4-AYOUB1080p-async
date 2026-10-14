@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -57,13 +58,35 @@ public:
         workers.clear();
     }
 
-    void Submit(Pipeline* pipeline) {
+    /// front: pipelines the game needs now go ahead of the background preload queue.
+    void Submit(Pipeline* pipeline, bool front = false) {
         {
             std::scoped_lock lk{mutex};
-            queue.push_back(pipeline);
+            if (front) {
+                queue.push_front(pipeline);
+            } else {
+                queue.push_back(pipeline);
+            }
             ++pending;
         }
         work_cv.notify_one();
+    }
+
+    /// Moves a queued pipeline to the front so a draw needing a preloaded pipeline gets it first.
+    void Prioritize(const Pipeline* pipeline) {
+        std::scoped_lock lk{mutex};
+        const auto it = std::ranges::find(queue, pipeline);
+        if (it == queue.end()) {
+            return;
+        }
+        Pipeline* queued = *it;
+        queue.erase(it);
+        queue.push_front(queued);
+    }
+
+    /// Logs once when the queue first drains after background preloading submitted work.
+    void NotePreload() {
+        preload_drain_log.store(true, std::memory_order_relaxed);
     }
 
     /// Waits until the pipeline is compiled or the timeout expires, returns true if it is ready.
@@ -77,6 +100,12 @@ public:
             return false;
         }
         return done_cv.wait_for(lk, timeout, [pipeline] { return pipeline->IsReady(); });
+    }
+
+    /// Waits until the pipeline is compiled, however long it takes (it must be queued or running).
+    void WaitReady(const Pipeline* pipeline) {
+        std::unique_lock lk{mutex};
+        done_cv.wait(lk, [pipeline] { return pipeline->IsReady(); });
     }
 
     /// Waits until every submitted pipeline is compiled.
@@ -105,6 +134,10 @@ private:
             {
                 std::scoped_lock lk{mutex};
                 --pending;
+                if (pending == 0 &&
+                    preload_drain_log.exchange(false, std::memory_order_relaxed)) {
+                    LOG_INFO(Render_Vulkan, "Background pipeline cache load finished");
+                }
             }
             done_cv.notify_all();
         }
@@ -115,6 +148,7 @@ private:
     std::condition_variable done_cv;
     std::deque<Pipeline*> queue;
     u32 pending{};
+    std::atomic<bool> preload_drain_log{};
     std::vector<std::jthread> workers;
 };
 
@@ -717,7 +751,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
              "Compute shader LDS barriers for multi wave workgroups: {}, buffer memory barriers "
              "within split GCN waves: {}",
              lds_multi_wave, profile.wave_memory_barriers);
-    WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
@@ -727,6 +760,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     const u32 num_compilers = std::clamp(std::thread::hardware_concurrency() / 4, 2U, 8U);
     compiler = std::make_unique<PipelineCompiler>(num_compilers);
     LOG_INFO(Render_Vulkan, "Pipelines can be compiled by {} worker threads", num_compilers);
+    WarmUp();
 }
 
 PipelineCache::~PipelineCache() {
@@ -734,8 +768,13 @@ PipelineCache::~PipelineCache() {
     compiler.reset();
 }
 
-void PipelineCache::CompileAsync(Pipeline* pipeline) {
+void PipelineCache::SubmitPreload(Pipeline* pipeline) {
+    compiler->NotePreload();
     compiler->Submit(pipeline);
+}
+
+void PipelineCache::CompileAsync(Pipeline* pipeline) {
+    compiler->Submit(pipeline, true);
     // A pipeline found in the driver cache is ready within a few milliseconds, which is worth
     // waiting for instead of skipping the draw.
     const u32 wait_us =
@@ -755,13 +794,27 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     const bool key_memo =
         Common::Perf::GetTuning().pipeline_key_memo.load(std::memory_order_relaxed);
     if (key_memo && last_graphics_pipeline != nullptr && last_graphics_key == graphics_key) {
-        Common::Perf::Add(Common::Perf::PipelineKeyMemoHits);
-        return last_graphics_pipeline;
+        if (last_graphics_pipeline->IsReady()) {
+            Common::Perf::Add(Common::Perf::PipelineKeyMemoHits);
+            return last_graphics_pipeline;
+        }
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (!is_new) {
+        GraphicsPipeline* const pipeline = it->second.get();
+        if (!pipeline->IsReady()) {
+            compiler->Prioritize(pipeline);
+            if (Common::Perf::GetTuning().async_pipelines.load(std::memory_order_relaxed) == 0) {
+                compiler->WaitReady(pipeline); // synchronous mode: never skip the draw
+            }
+            const u32 wait_us =
+                Common::Perf::GetTuning().async_pipeline_wait_us.load(std::memory_order_relaxed);
+            if (wait_us != 0) {
+                compiler->WaitFor(pipeline, std::chrono::microseconds{wait_us});
+            }
+        }
         last_graphics_key = graphics_key;
-        last_graphics_pipeline = it->second.get();
+        last_graphics_pipeline = pipeline->IsReady() ? pipeline : nullptr;
     }
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
@@ -827,6 +880,21 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         }
         Common::Perf::Add(Common::Perf::PipelineStallNs, Common::Perf::NowNs() - start_ns);
         return pipeline;
+    }
+    ComputePipeline* const pipeline = it->second.get();
+    if (!pipeline->IsReady()) {
+        compiler->Prioritize(pipeline);
+        if (Common::Perf::GetTuning().async_pipelines.load(std::memory_order_relaxed) < 2) {
+            // Compute work is not skipped in this mode (the CUSA00004 profile): a preloaded
+            // compute pipeline still queued is compiled first and waited for.
+            compiler->WaitReady(pipeline);
+            return pipeline;
+        }
+        const u32 wait_us =
+            Common::Perf::GetTuning().async_pipeline_wait_us.load(std::memory_order_relaxed);
+        if (wait_us != 0) {
+            compiler->WaitFor(pipeline, std::chrono::microseconds{wait_us});
+        }
     }
     return it->second.get();
 }

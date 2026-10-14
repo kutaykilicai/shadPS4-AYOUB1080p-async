@@ -354,6 +354,8 @@ struct Tuning {
     /// 1: graphics pipelines are compiled by worker threads and draws using a pipeline that is
     /// not ready yet are skipped. 2: same for compute pipelines and dispatches.
     std::atomic<u32> async_pipelines{2};
+    /// Preloaded pipeline cache entries are compiled by worker threads instead of WarmUp().
+    std::atomic<bool> background_cache_load{true};
     /// How long the command processor waits for a new pipeline before skipping its work.
     std::atomic<u32> async_pipeline_wait_us{3000};
     /// Records a GPU checkpoint before each draw and dispatch, reported with the device fault

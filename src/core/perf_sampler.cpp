@@ -243,6 +243,8 @@ void PollTuning() {
         } else if (key == "async_pipelines") {
             tuning.async_pipelines.store(std::min<u32>(std::strtoul(value.c_str(), nullptr, 10), 2),
                                          std::memory_order_relaxed);
+        } else if (key == "background_cache_load") {
+            tuning.background_cache_load.store(value != "0", std::memory_order_relaxed);
         } else if (key == "trace_reads") {
             // "lo-hi" guest range in hex, empty or 0: off.
             char* end{};
@@ -406,7 +408,7 @@ void PollTuning() {
     }
     LOG_INFO(Debug,
              "Perf tuning applied: readback_window_kb={} readback_write_discard={} "
-             "readback_write_merge={} readback_keep_ranges={} async_readbacks={} readback_prefetch={} async_pipelines={} "
+             "readback_write_merge={} readback_keep_ranges={} async_readbacks={} readback_prefetch={} async_pipelines={} background_cache_load={} "
              "async_pipeline_wait_ms={} gpu_checkpoints={} hot_page_faults={} "
              "hot_page_cooldown_frames={} hot_page_hash={} readback_queue={} stream_dedup={} "
              "stream_static={} stream_static_frames={} max_gpu_lag_frames={} gpu_clock_div={} "
@@ -427,6 +429,7 @@ void PollTuning() {
              tuning.async_readbacks.load(std::memory_order_relaxed),
              tuning.readback_prefetch.load(std::memory_order_relaxed),
              tuning.async_pipelines.load(std::memory_order_relaxed),
+             tuning.background_cache_load.load(std::memory_order_relaxed),
              tuning.async_pipeline_wait_us.load(std::memory_order_relaxed) / 1000,
              tuning.gpu_checkpoints.load(std::memory_order_relaxed),
              tuning.hot_page_faults.load(std::memory_order_relaxed),

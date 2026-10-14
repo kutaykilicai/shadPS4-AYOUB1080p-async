@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
+#include "common/perf_stats.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -175,12 +178,18 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *infos[0], modules[0], sdata, true);
+    const bool defer = preload_background;
+    it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                   *pipeline_cache, compute_key, *infos[0],
+                                                   modules[0], sdata, true, defer);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
+
+    if (defer) {
+        SubmitPreload(it.value().get());
+        ++num_background_pipelines;
+    }
 
     return true;
 }
@@ -250,13 +259,20 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
-    it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+    const bool defer = preload_background;
+    it.value() = std::make_unique<GraphicsPipeline>(instance, scheduler, desc_heap, profile,
+                                                    graphics_key, *pipeline_cache, infos,
+                                                    runtime_infos, fetch_shader, modules, sdata,
+                                                    true, defer);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
     fetch_shader = nullptr;
+
+    if (defer) {
+        SubmitPreload(it.value().get());
+        ++num_background_pipelines;
+    }
 
     return true;
 }
@@ -323,6 +339,12 @@ void PipelineCache::WarmUp() {
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
     }
+
+    const char* background_env = std::getenv("SHADPS4_BACKGROUND_CACHE");
+    preload_background =
+        Common::Perf::GetTuning().background_cache_load.load(std::memory_order_relaxed) &&
+        !(background_env != nullptr && background_env[0] == '0');
+    num_background_pipelines = 0;
 
     Storage::DataBase::Instance().Open();
 
@@ -395,7 +417,8 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    LOG_INFO(Render, "Preloaded {} pipelines, {} compiling in the background", num_pipelines,
+             num_background_pipelines);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

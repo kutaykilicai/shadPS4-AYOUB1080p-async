@@ -241,6 +241,8 @@ private:
 
     /// Hands a pipeline created with a deferred compilation to the worker threads, then waits
     /// for it at most async_pipeline_wait_ms. Callers skip their work while it is not ready.
+    /// Queues a preloaded pipeline (defer_compile) behind the pipelines the game needs.
+    void SubmitPreload(Pipeline* pipeline);
     void CompileAsync(Pipeline* pipeline);
 
 private:
@@ -288,6 +290,9 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    /// WarmUp only: effective background_cache_load and how many preloads were queued.
+    bool preload_background{};
+    u32 num_background_pipelines{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
