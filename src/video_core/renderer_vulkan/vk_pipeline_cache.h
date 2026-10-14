@@ -241,9 +241,9 @@ private:
 
     /// Hands a pipeline created with a deferred compilation to the worker threads, then waits
     /// for it at most async_pipeline_wait_ms. Callers skip their work while it is not ready.
+    void CompileAsync(Pipeline* pipeline);
     /// Queues a preloaded pipeline (defer_compile) behind the pipelines the game needs.
     void SubmitPreload(Pipeline* pipeline);
-    void CompileAsync(Pipeline* pipeline);
 
 private:
     const Instance& instance;

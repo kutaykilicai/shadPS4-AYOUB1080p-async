@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <unordered_set>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -75,6 +76,10 @@ public:
     /// Moves a queued pipeline to the front so a draw needing a preloaded pipeline gets it first.
     void Prioritize(const Pipeline* pipeline) {
         std::scoped_lock lk{mutex};
+        // Once moved to the front it stays ahead of the preload backlog: no new scan per draw.
+        if (!prioritized.insert(pipeline).second) {
+            return;
+        }
         const auto it = std::ranges::find(queue, pipeline);
         if (it == queue.end()) {
             return;
@@ -104,8 +109,12 @@ public:
 
     /// Waits until the pipeline is compiled, however long it takes (it must be queued or running).
     void WaitReady(const Pipeline* pipeline) {
+        // Bounded: on timeout the caller sees a pipeline that is not ready and skips the work.
         std::unique_lock lk{mutex};
-        done_cv.wait(lk, [pipeline] { return pipeline->IsReady(); });
+        if (!done_cv.wait_for(lk, std::chrono::seconds{2},
+                              [pipeline] { return pipeline->IsReady(); })) {
+            LOG_WARNING(Render_Vulkan, "Pipeline still compiling after 2 s, work skipped");
+        }
     }
 
     /// Waits until every submitted pipeline is compiled.
@@ -149,6 +158,7 @@ private:
     std::deque<Pipeline*> queue;
     u32 pending{};
     std::atomic<bool> preload_drain_log{};
+    std::unordered_set<const Pipeline*> prioritized;
     std::vector<std::jthread> workers;
 };
 
