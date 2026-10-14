@@ -4,9 +4,15 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <stop_token>
+#include <thread>
+#include <vector>
 #include <shared_mutex>
 #include <variant>
 #include <tsl/robin_map.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <xxhash.h>
 #include "video_core/amdgpu/scout.h"
@@ -290,9 +296,20 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
-    /// WarmUp only: effective background_cache_load and how many preloads were queued.
-    bool preload_background{};
-    u32 num_background_pipelines{};
+    /// Background cache load (background_cache_load / SHADPS4_BACKGROUND_CACHE).
+    struct PreloadStage;
+    struct PreloadEntry;
+    struct BackgroundLoad;
+    void StartBackgroundLoad();
+    void BackgroundLoadThread(std::stop_token stoken);
+    std::shared_ptr<PreloadStage> ReadPreloadStage(u64 hash,
+        std::unordered_map<u64, std::shared_ptr<PreloadStage>>& stages);
+    bool MergePreloadStage(PreloadStage& stage);
+    /// Command processor: publishes a few loaded pipelines (called by Get*Pipeline).
+    void PumpBackgroundLoad();
+    void StopBackgroundLoad();
+    BackgroundLoad* background_load{}; ///< Owned; deleted by StopBackgroundLoad.
+    bool background_load_active{};                  ///< Command processor only.
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

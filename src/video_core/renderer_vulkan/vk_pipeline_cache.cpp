@@ -89,10 +89,6 @@ public:
         queue.push_front(queued);
     }
 
-    /// Logs once when the queue first drains after background preloading submitted work.
-    void NotePreload() {
-        preload_drain_log.store(true, std::memory_order_relaxed);
-    }
 
     /// Waits until the pipeline is compiled or the timeout expires, returns true if it is ready.
     /// Does not wait when every worker is busy: the pipeline would not even start in time.
@@ -143,10 +139,6 @@ private:
             {
                 std::scoped_lock lk{mutex};
                 --pending;
-                if (pending == 0 &&
-                    preload_drain_log.exchange(false, std::memory_order_relaxed)) {
-                    LOG_INFO(Render_Vulkan, "Background pipeline cache load finished");
-                }
             }
             done_cv.notify_all();
         }
@@ -157,7 +149,6 @@ private:
     std::condition_variable done_cv;
     std::deque<Pipeline*> queue;
     u32 pending{};
-    std::atomic<bool> preload_drain_log{};
     std::unordered_set<const Pipeline*> prioritized;
     std::vector<std::jthread> workers;
 };
@@ -774,12 +765,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
-    // Workers reference the pipelines, stop them first.
+    // The cache loader thread first (it uses the database and the device), then the workers,
+    // which reference the pipelines.
+    StopBackgroundLoad();
     compiler.reset();
 }
 
 void PipelineCache::SubmitPreload(Pipeline* pipeline) {
-    compiler->NotePreload();
     compiler->Submit(pipeline);
 }
 
@@ -795,6 +787,7 @@ void PipelineCache::CompileAsync(Pipeline* pipeline) {
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    PumpBackgroundLoad();
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -862,6 +855,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    PumpBackgroundLoad();
     if (!RefreshComputeKey()) {
         return nullptr;
     }

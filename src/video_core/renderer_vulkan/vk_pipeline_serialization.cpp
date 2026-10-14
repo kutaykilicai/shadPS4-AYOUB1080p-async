@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <cstdlib>
+#include <unordered_map>
 
 #include "common/perf_stats.h"
 #include "common/serdes.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
@@ -178,18 +181,12 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
-    const bool defer = preload_background;
-    it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                   *pipeline_cache, compute_key, *infos[0],
-                                                   modules[0], sdata, true, defer);
+    it.value() =
+        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
+                                          compute_key, *infos[0], modules[0], sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
-
-    if (defer) {
-        SubmitPreload(it.value().get());
-        ++num_background_pipelines;
-    }
 
     return true;
 }
@@ -259,20 +256,13 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
-    const bool defer = preload_background;
-    it.value() = std::make_unique<GraphicsPipeline>(instance, scheduler, desc_heap, profile,
-                                                    graphics_key, *pipeline_cache, infos,
-                                                    runtime_infos, fetch_shader, modules, sdata,
-                                                    true, defer);
+    it.value() = std::make_unique<GraphicsPipeline>(
+        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+        runtime_infos, fetch_shader, modules, sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
     fetch_shader = nullptr;
-
-    if (defer) {
-        SubmitPreload(it.value().get());
-        ++num_background_pipelines;
-    }
 
     return true;
 }
@@ -341,10 +331,12 @@ void PipelineCache::WarmUp() {
     }
 
     const char* background_env = std::getenv("SHADPS4_BACKGROUND_CACHE");
-    preload_background =
+    // The zip archive store is read and written by one handle: background loading needs the
+    // directory store, where reads and the game's new entries are separate files.
+    const bool background =
         Common::Perf::GetTuning().background_cache_load.load(std::memory_order_relaxed) &&
-        !(background_env != nullptr && background_env[0] == '0');
-    num_background_pipelines = 0;
+        !(background_env != nullptr && background_env[0] == '0') &&
+        !EmulatorSettings.IsPipelineCacheArchived();
 
     Storage::DataBase::Instance().Open();
 
@@ -386,6 +378,11 @@ void PipelineCache::WarmUp() {
         return;
     }
 
+    if (background) {
+        StartBackgroundLoad();
+        return;
+    }
+
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
@@ -417,8 +414,7 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines, {} compiling in the background", num_pipelines,
-             num_background_pipelines);
+    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
@@ -427,9 +423,296 @@ void PipelineCache::WarmUp() {
     Storage::DataBase::Instance().FinishPreload();
 }
 
+// Background cache load. A loader thread reads the store, deserializes the shaders and creates
+// their modules; it touches no PipelineCache state. The command processor merges the shaders into
+// program_cache and creates the pipelines (compiled by the PipelineCompiler workers) a few at a
+// time, so the game starts at once. A pipeline the game asks for first is compiled normally and
+// the loaded copy is dropped.
+struct PipelineCache::PreloadStage {
+    vk::Device device;
+    std::unique_ptr<Program> program; ///< Moved into program_cache when the shader is new.
+    Shader::StageSpecialization spec{};
+    size_t perm_idx{};
+    vk::ShaderModule module{};
+    // Command processor only (MergePreloadStage).
+    bool merged{};
+    bool module_kept{};
+    const Shader::Info* info{}; ///< Null: unusable.
+    vk::ShaderModule result{};
+
+    ~PreloadStage() {
+        if (module && !module_kept) {
+            device.destroyShaderModule(module);
+        }
+    }
+};
+
+struct PipelineCache::PreloadEntry {
+    bool compute{};
+    GraphicsPipelineKey graphics_key{};
+    ComputePipelineKey compute_key{};
+    GraphicsPipeline::SerializationSupport sdata{};
+    std::array<std::shared_ptr<PreloadStage>, MaxShaderStages> stages{};
+};
+
+struct PipelineCache::BackgroundLoad {
+    std::mutex mutex;
+    std::vector<PreloadEntry> inbox; ///< Guarded by mutex.
+    std::atomic<bool> reading{true};
+    std::atomic<u32> total{0}, read{0};
+    // Command processor only.
+    u32 published{}, skipped{};
+    std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
+    std::chrono::steady_clock::time_point last_pump{};
+    std::jthread thread; ///< Last member: joined before the rest is destroyed.
+};
+
+void PipelineCache::StartBackgroundLoad() {
+    background_load = new BackgroundLoad{};
+    background_load_active = true;
+    background_load->thread =
+        std::jthread{[this](std::stop_token stoken) { BackgroundLoadThread(stoken); }};
+    LOG_INFO(Render, "Pipeline cache loading in the background, the game starts meanwhile");
+}
+
+std::shared_ptr<PipelineCache::PreloadStage> PipelineCache::ReadPreloadStage(
+    u64 hash, std::unordered_map<u64, std::shared_ptr<PreloadStage>>& stages) {
+    if (const auto it = stages.find(hash); it != stages.end()) {
+        return it->second; // null when it could not be read
+    }
+    auto& slot = stages[hash];
+    std::vector<u8> meta_blob;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", hash),
+                                       meta_blob);
+    if (meta_blob.empty()) {
+        return nullptr;
+    }
+    auto stage = std::make_shared<PreloadStage>();
+    stage->device = instance.GetDevice();
+    stage->program = std::make_unique<Program>();
+    stage->spec.info = &stage->program->info;
+    Serialization::Archive meta_ar{std::move(meta_blob)};
+    if (!LoadShaderMeta(meta_ar, stage->program->info, stage->spec, stage->perm_idx)) {
+        return nullptr;
+    }
+    std::vector<u32> spv{};
+    Storage::DataBase::Instance().Load(
+        Storage::BlobType::ShaderBinary,
+        fmt::format("{:#018x}_{}", stage->program->info.pgm_hash, stage->perm_idx), spv);
+    if (spv.empty()) {
+        return nullptr;
+    }
+    stage->module = CompileSPV(spv, instance.GetDevice());
+    slot = stage;
+    return stage;
+}
+
+void PipelineCache::BackgroundLoadThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:CacheLoader");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    auto& load = *background_load;
+    std::unordered_map<u64, std::shared_ptr<PreloadStage>> stages; // this thread only
+    Storage::DataBase::Instance().ForEachBlob(
+        Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+            if (stoken.stop_requested()) {
+                return;
+            }
+            load.total.fetch_add(1, std::memory_order_relaxed);
+            Serialization::Archive ar{std::move(data)};
+            Serialization::Reader pldata{ar};
+            u32 version{};
+            pldata.Read(version);
+            if (version != Serialization::PipelineKeyVersion) {
+                return;
+            }
+            u32 is_compute{};
+            pldata.Read(is_compute);
+            PreloadEntry entry{};
+            entry.compute = is_compute != 0;
+            if (entry.compute) {
+                entry.compute_key.Deserialize(ar);
+                ComputePipeline::SerializationSupport compute_data{};
+                compute_data.Deserialize(ar);
+                entry.stages[0] = ReadPreloadStage(entry.compute_key.value, stages);
+                if (!entry.stages[0]) {
+                    return;
+                }
+            } else {
+                entry.graphics_key.Deserialize(ar);
+                entry.sdata.Deserialize(ar);
+                for (u32 i = 0; i < MaxShaderStages; ++i) {
+                    const u64 hash = entry.graphics_key.stage_hashes[i];
+                    if (!hash) {
+                        continue;
+                    }
+                    entry.stages[i] = ReadPreloadStage(hash, stages);
+                    if (!entry.stages[i]) {
+                        return;
+                    }
+                }
+            }
+            load.read.fetch_add(1, std::memory_order_relaxed);
+            std::scoped_lock lk{load.mutex};
+            load.inbox.push_back(std::move(entry));
+        });
+    load.reading.store(false, std::memory_order_release);
+}
+
+bool PipelineCache::MergePreloadStage(PreloadStage& stage) {
+    // Called with program_cache_mutex held exclusively (the scout thread reads the programs).
+    stage.merged = true;
+    const u64 hash = stage.program->info.pgm_hash;
+    auto it_pgm = program_cache.find(hash);
+    if (it_pgm == program_cache.end()) {
+        Program* const program = stage.program.get();
+        program->InsertPermut(stage.module, std::move(stage.spec), stage.perm_idx);
+        program_cache.emplace(hash, std::move(stage.program));
+        stage.module_kept = true;
+        stage.result = stage.module;
+        stage.info = &program->info;
+        return true;
+    }
+    Program& program = *it_pgm.value();
+    const auto it = std::ranges::find(program.modules, stage.spec, &Program::Module::spec);
+    if (it != program.modules.end()) {
+        if (size_t(std::distance(program.modules.begin(), it)) != stage.perm_idx) {
+            return false; // the game numbered its permutations differently
+        }
+        stage.result = it->module;
+    } else {
+        if (stage.perm_idx < program.modules.size() && program.modules[stage.perm_idx].module) {
+            return false; // the index holds another permutation
+        }
+        stage.spec.info = &program.info;
+        program.InsertPermut(stage.module, std::move(stage.spec), stage.perm_idx);
+        stage.module_kept = true;
+        stage.result = stage.module;
+    }
+    stage.info = &program.info;
+    return true;
+}
+
+void PipelineCache::PumpBackgroundLoad() {
+    if (!background_load_active) [[likely]] {
+        return;
+    }
+    auto& load = *background_load;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - load.last_pump < std::chrono::milliseconds{2}) {
+        return;
+    }
+    load.last_pump = now;
+    const bool reading = load.reading.load(std::memory_order_acquire);
+    std::vector<PreloadEntry> batch;
+    {
+        std::scoped_lock lk{load.mutex};
+        const size_t n = std::min<size_t>(load.inbox.size(), 16);
+        batch.assign(std::make_move_iterator(load.inbox.begin()),
+                     std::make_move_iterator(load.inbox.begin() + n));
+        load.inbox.erase(load.inbox.begin(), load.inbox.begin() + n);
+    }
+    static const std::array<Shader::RuntimeInfo, MaxShaderStages> no_runtime_infos{};
+    for (auto& entry : batch) {
+        if (entry.compute ? compute_pipelines.contains(entry.compute_key)
+                          : graphics_pipelines.contains(entry.graphics_key)) {
+            ++load.skipped; // the game compiled it first
+            continue;
+        }
+        std::array<const Shader::Info*, MaxShaderStages> stage_infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> stage_modules{};
+        const Shader::Gcn::FetchShaderData* stage_fetch = nullptr;
+        bool usable = true;
+        {
+            std::unique_lock lock{program_cache_mutex};
+            for (u32 i = 0; i < MaxShaderStages && usable; ++i) {
+                if (!entry.stages[i]) {
+                    continue;
+                }
+                auto& stage = *entry.stages[i];
+                if (!stage.merged) {
+                    MergePreloadStage(stage);
+                }
+                usable = stage.info != nullptr;
+                stage_infos[i] = stage.info;
+                stage_modules[i] = stage.result;
+            }
+            if (usable) {
+                // As the synchronous load: the fetch shader of the last stage that has one.
+                for (u32 i = 0; i < MaxShaderStages; ++i) {
+                    if (!entry.stages[i]) {
+                        continue;
+                    }
+                    Program* const program = program_cache.find(stage_infos[i]->pgm_hash)->second.get();
+                    const size_t idx = entry.stages[i]->perm_idx;
+                    if (idx < program->modules.size()) {
+                        if (auto& fetch = program->modules[idx].spec.fetch_shader_data;
+                            !fetch.Empty()) {
+                            stage_fetch = &fetch;
+                        }
+                    }
+                }
+            }
+        }
+        if (!usable) {
+            ++load.skipped;
+            continue;
+        }
+        Pipeline* pipeline{};
+        if (entry.compute) {
+            ComputePipeline::SerializationSupport compute_data{};
+            auto& slot = compute_pipelines[entry.compute_key];
+            slot = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                     *pipeline_cache, entry.compute_key,
+                                                     *stage_infos[0], stage_modules[0],
+                                                     compute_data, true, true);
+            pipeline = slot.get();
+        } else {
+            auto& slot = graphics_pipelines[entry.graphics_key];
+            slot = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, entry.graphics_key, *pipeline_cache,
+                stage_infos, no_runtime_infos, stage_fetch, stage_modules, entry.sdata, true, true);
+            pipeline = slot.get();
+        }
+        SubmitPreload(pipeline);
+        ++load.published;
+    }
+    if (reading) {
+        return;
+    }
+    {
+        std::scoped_lock lk{load.mutex};
+        if (!load.inbox.empty()) {
+            return;
+        }
+    }
+    // Logged once: everything read was published or skipped (the workers still compile).
+    LOG_INFO(Render,
+             "Background pipeline cache load finished in {:.1f} s: {} pipelines queued for "
+             "compilation, {} skipped, {} entries in the store",
+             std::chrono::duration<double>(now - load.started).count(), load.published,
+             load.skipped, load.total.load());
+    background_load_active = false;
+    StopBackgroundLoad();
+}
+
+void PipelineCache::StopBackgroundLoad() {
+    if (!background_load) {
+        return;
+    }
+    background_load_active = false;
+    background_load->thread.request_stop();
+    if (background_load->thread.joinable()) {
+        background_load->thread.join();
+    }
+    delete background_load; // unpublished entries destroy their unused modules
+    background_load = nullptr;
+}
+
 void PipelineCache::Sync() {
+    StopBackgroundLoad();
     Storage::DataBase::Instance().Close();
 }
+
 
 } // namespace Vulkan
 
