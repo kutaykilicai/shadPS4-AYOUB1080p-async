@@ -421,3 +421,10 @@ cmake-build-*
 
 # Nix Result symlink
 result
+
+# Local secrets and user data (keep out of commits)
+.env
+.env.*
+*.local.json
+user/
+screenshots/private/

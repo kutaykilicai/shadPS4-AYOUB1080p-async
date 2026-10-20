@@ -8,7 +8,12 @@ SPDX-License-Identifier: GPL-2.0-or-later
 A fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PlayStation 4 emulator, tuned to run
 **inFAMOUS Second Son** smoothly.
 
-[English](#english) · [Français](#français)
+[Türkçe](#türkçe) · [English](#english) · [Français](#français)
+
+> **Credits:** this repository is built on [shadPS4](https://github.com/shadps4-emu/shadPS4) by the
+> shadPS4 team and contributors, and on the shadPS4-AYOUB1080p build by Ayoub
+> ([@weshayoub92](https://github.com/weshayoub92)). The `-async` changes (pipeline cache loaded on a
+> background thread, bounded waits) are by Kutay Kılıç. License: GPL-2.0-or-later, same as upstream.
 
 > **Unofficial, independent project.** It is not affiliated with, approved, endorsed or sponsored by
 > Sony Interactive Entertainment, Sucker Punch Productions or the shadPS4 team. PlayStation, PS4 and
@@ -21,6 +26,20 @@ A fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PlayStation 4 em
 > Sucker Punch Productions ou l'équipe de shadPS4. Aucun fichier de jeu, aucune clé, aucun firmware,
 > aucun module système ni cache de shaders. À utiliser uniquement avec vos propres jeux, extraits de
 > votre propre console.
+
+## Türkçe
+
+shadPS4 PS4 emülatörünün bir çatalı. Ayoub'un inFAMOUS Second Son için hazırladığı AYOUB1080p
+sürümünün üzerine, pipeline önbelleğinin arka planda yüklenmesini ekledim. Böylece oyun açılırken
+önbellek yüklenmesi beklenmiyor, eksik pipeline'lar ihtiyaç anında öne alınıyor.
+
+- **Derleme:** aşağıdaki İngilizce bölümdeki adımlar geçerli (Windows, CMake, Visual Studio 2022 veya
+  Clang). GitHub Actions'taki `windows.yml` aynı derlemeyi yapıyor.
+- **Kullanım:** `shadps4.exe -g "<oyun klasörü>\CUSA00004\eboot.bin"`
+- **Uyarı:** Resmi bir proje değildir; Sony, Sucker Punch veya shadPS4 ekibiyle bağı yoktur. Depoda
+  oyun dosyası, anahtar, firmware ya da sistem modülü yoktur. Yalnızca kendi konsolunuzdan aldığınız,
+  size ait oyunlarla kullanın.
+- **Lisans:** GPL-2.0-or-later (shadPS4 ile aynı).
 
 ## English
 
